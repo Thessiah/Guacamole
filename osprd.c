@@ -64,13 +64,11 @@ typedef struct osprd_info {
 
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
-	//////////////////////////////////////
-	int num_reader;
-	int num_writer;
-	unsigned* invalid_tickets_array;
-	unsigned int num_invalid_tikets;
-	pid_t current_popular_writer;
-
+	pid_t curr_writer;
+	int num_readers;
+	int num_writers;
+	unsigned* bad_tickets;
+	int num_bad_tickets;
 
 	// The following elements are used internally; you don't need
 	// to understand them.
@@ -128,25 +126,20 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// 'req->buffer' members, and the rq_data_dir() function.
 
 	// Your code here.
-	unsigned long offset = req->sector*SECTOR_SIZE;
-	unsigned long dataSize = req->current_nr_sectors*SECTOR_SIZE;
-
-	if (rq_data_dir(req) == READ) {
+	int offset = req->sector*SECTOR_SIZE;
+	int size = req->current_nr_sectors*SECTOR_SIZE;
+	if (rq_data_dir(req) == READ) 
+	{
 		osp_spin_lock(&(d->mutex));
-		memcpy(req->buffer, d->data + offset, dataSize);
+		memcpy(req->buffer, d->data + offset, size);
 		osp_spin_unlock(&(d->mutex));
 	}
-	else if (rq_data_dir(req) == WRITE){
+	else if (rq_data_dir(req) == WRITE)
+	{
 		osp_spin_lock(&(d->mutex));
-		memcpy(d->data + offset, req->buffer, dataSize);
+		memcpy(d->data + offset, req->buffer, size);
 		osp_spin_unlock(&(d->mutex));
 	}
-	else{
-		end_request(req, 1);
-	}
-
-	//eprintk("Should process request...\n");
-
 	end_request(req, 1);
 }
 
@@ -179,28 +172,29 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 
 		//first thing first, lock the mutex
 		osp_spin_lock(&(d->mutex));
-		if (filp_writable) {  //fire the writer
-			if (filp->f_flags&F_OSPRD_LOCKED && d->num_writer != 0) {
+		if (filp_writable)
+		{  //fire the writer
+			if (filp->f_flags & F_OSPRD_LOCKED && d->num_writers != 0)
+			{
 				filp->f_flags &= ~F_OSPRD_LOCKED;
 			}
-			d->num_writer = 0;
-			d->current_popular_writer = -1;
+			d->num_writers = 0;
+			d->curr_writer = -1;
 		}
-		else{               //a reader is tired of reading
-			if (filp->f_flags && d->num_reader != 0) {
-				d->num_reader--;
+		else
+		{               //a reader is tired of reading
+			if (filp->f_flags && d->num_readers != 0)
+			{
+				d->num_readers--;
 			}
-			if (d->num_reader == 0) {  //we can unlock if no reader is interested in reading
+			if (d->num_readers == 0)
+			{  //we can unlock if no reader is interested in reading
 				filp->f_flags &= ~F_OSPRD_LOCKED;
 			}
 		}
 		wake_up_all(&(d->blockq));
 		osp_spin_unlock(&(d->mutex));
-		// This line avoids compiler warnings; you may remove it.
-		(void)filp_writable, (void)d;
-
 	}
-
 	return 0;
 }
 
@@ -267,72 +261,71 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Your code here (instead of the next two lines).
 		//buy a ticket and wait in line
 		osp_spin_lock(&(d->mutex));
-		unsigned my_ticket = d->ticket_head;
+		unsigned ticket = d->ticket_head;
 		d->ticket_head++;
 		osp_spin_unlock(&(d->mutex));
-		if (filp_writable) {        //trying to obtain write lock
-			/*wait until no one has read or write lock
-			if condition becomes true, signal is sent to process and
-			needs to invalidate the ticket*/
-			//eprintk("trying to get write lock...\nnum_writer: %d num_reader: %d\n", d->num_writer, d->num_reader);
-			if (wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket&&d->num_reader == 0 && d->num_writer == 0) == -ERESTARTSYS) {
+		if (filp_writable)//trying to obtain write lock
+		{/*wait until no one has read or write lock if condition becomes true, signal is sent to process and needs to invalidate the ticket*/
+			if (wait_event_interruptible(d->blockq, d->num_readers == 0 && d->num_writers == 0 && d->ticket_tail == ticket) == -ERESTARTSYS)
+			{
 				osp_spin_lock(&(d->mutex));
-				if (d->ticket_tail == my_ticket) {
+				if (d->ticket_tail == ticket)
+				{
 					d->ticket_tail++;
 				}
-				else{
-					d->invalid_tickets_array[d->num_invalid_tikets++] = my_ticket;
-					d->num_invalid_tikets++;
+				else
+				{
+					d->bad_tickets[d->num_bad_tickets++] = ticket;
+					d->num_bad_tickets++;
 				}
 				osp_spin_unlock(&(d->mutex));
 				return -ERESTARTSYS;
 			}
 			//get your write lock here, good luck writing!
-			//eprintk("I got write lock!\n");
 			osp_spin_lock(&(d->mutex));
-			d->num_writer++;
-			d->current_popular_writer = current->pid;
+			d->num_writers++;
+			d->curr_writer = current->pid;
 			filp->f_flags |= F_OSPRD_LOCKED;
 			osp_spin_unlock(&(d->mutex));
 		}
-		else{                      //trying to obtain read lock
-			//eprintk("trying to get read lock...\nnum_writer: %d num_reader\n",d->num_writer, d->num_reader);
-			if (wait_event_interruptible(d->blockq, (d->ticket_tail == my_ticket && d->num_writer == 0)) == -ERESTARTSYS) {
+		else
+		{                      //trying to obtain read lock
+			if (wait_event_interruptible(d->blockq, (d->num_writers == 0 && d->ticket_tail == ticket)) == -ERESTARTSYS)
+			{
 				osp_spin_lock(&(d->mutex));
-				if (d->ticket_tail == my_ticket) {
+				if (d->ticket_tail == ticket)
+				{
 					d->ticket_tail++;
 				}
-				else{
-					d->invalid_tickets_array[d->num_invalid_tikets++] = my_ticket;
-					d->num_invalid_tikets++;
+				else
+				{
+					d->bad_tickets[d->num_bad_tickets++] = ticket;
+					d->num_bad_tickets++;
 				}
 				osp_spin_unlock(&(d->mutex));
 				return -ERESTARTSYS;
 			}
 			//get your read lock here, good luck reading!
-			//eprintk("I got read lock!\n");
 			osp_spin_lock(&(d->mutex));
-			d->num_reader++;
+			d->num_readers++;
 			filp->f_flags |= F_OSPRD_LOCKED;
 			osp_spin_unlock(&(d->mutex));
 		}
 		//next in line please! But we need to check if next guy is still alive :-)
 		osp_spin_lock(&(d->mutex));
 		d->ticket_tail++;
-		int i = 0;
-		for (; i<d->num_invalid_tikets; i++) {
-			if (d->invalid_tickets_array[i] == d->ticket_tail) {
+		int i;
+		for(i = 0; i<d->num_bad_tickets; i++)
+		{
+			if (d->bad_tickets[i] == d->ticket_tail)
+			{
 				d->ticket_tail++;
-				d->invalid_tickets_array[i] = d->invalid_tickets_array[d->num_invalid_tikets];
-				d->num_invalid_tikets--;
+				d->bad_tickets[i] = d->bad_tickets[d->num_bad_tickets];
+				d->num_bad_tickets--;
 				i = 0;
 			}
 		}
 		osp_spin_unlock(&(d->mutex));
-		r = 0;
-		//eprintk("Attempting to acquire\n");
-		//r = -ENOTTY;
-
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
 		// EXERCISE: ATTEMPT to lock the ramdisk.
@@ -344,32 +337,36 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 		// Your code here (instead of the next two lines).
 		osp_spin_lock(&(d->mutex));
-		if (filp_writable) {  //a writer wants to publish his/her book!
-			if (d->num_reader == 0 && d->num_writer == 0) {
+		if (filp_writable)
+		{  //a writer wants to publish his/her book!
+			if (d->num_readers == 0 && d->num_writers == 0)
+			{
 				//writer get the lock, good luck writing!
-				d->num_writer++;
-				d->current_popular_writer = current->pid;
+				d->num_writers++;
+				d->curr_writer = current->pid;
 				filp->f_flags |= F_OSPRD_LOCKED;
 			}
-			else{
+			else
+			{
 				osp_spin_unlock(&(d->mutex));
 				return -EBUSY;
 			}
 		}
-		else{    //an avid reader is waiting for new book release!
-			if (d->num_writer == 0) {
+		else
+		{    //an avid reader is waiting for new book release!
+			if (d->num_writers == 0)
+			{
 				//reader grabs a book and run away
-				d->num_reader++;
+				d->num_readers++;
 				filp->f_flags |= F_OSPRD_LOCKED;
 			}
-			else{
+			else
+			{
 				osp_spin_unlock(&(d->mutex));
 				return -EBUSY;
 			}
 		}
 		osp_spin_unlock(&(d->mutex));
-		r = 0;
-
 	} else if (cmd == OSPRDIOCRELEASE) {
 
 		// EXERCISE: Unlock the ramdisk.
@@ -386,20 +383,19 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		if (filp_writable) {    //fire all writers
 			//eprintk("release write lock\n");
-			d->num_writer = 0;
+			d->num_writers = 0;
 			filp->f_flags &= ~F_OSPRD_LOCKED;
 		}
-		else{                  //one reader quit reading
-			d->num_reader--;
-			//eprintk("reduce reade locks to %d\n",d->num_reader);
-			if (d->num_reader == 0) {
+		else
+		{                  //one reader quit reading
+			d->num_readers--;
+			if (d->num_readers == 0)
+			{
 				filp->f_flags &= ~F_OSPRD_LOCKED;
 			}
 		}
 		wake_up_all(&(d->blockq));
 		osp_spin_unlock(&(d->mutex));
-		r = 0;
-
 	} else
 		r = -ENOTTY; /* unknown command */
 	return r;
@@ -415,12 +411,11 @@ static void osprd_setup(osprd_info_t *d)
 	osp_spin_lock_init(&d->mutex);
 	d->ticket_head = d->ticket_tail = 0;
 	/* Add code here if you add fields to osprd_info_t. */
-
-	d->num_writer = 0;
-	d->num_reader = 0;
-	d->invalid_tickets_array = (unsigned*)kmalloc(1024 * sizeof(unsigned), GFP_ATOMIC);
-	d->num_invalid_tikets = 0;
-	d->current_popular_writer = -1;
+	d->num_writers = 0;
+	d->num_readers = 0;
+	d->bad_tickets = (unsigned*)kmalloc(1024 * sizeof(unsigned), GFP_ATOMIC);
+	d->num_bad_tickets = 0;
+	d->curr_writer = -1;
 }
 
 
